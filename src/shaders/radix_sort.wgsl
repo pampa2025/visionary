@@ -1,57 +1,58 @@
-// shader implementing gpu radix sort. More information in the beginning of gpu_rs.rs
-// info: 
-
-// also the workgroup sizes are added in these prepasses
-// before the pipeline is started the following constant definitionis are prepended to this shadercode
-
-// const histogram_sg_size
-// const histogram_wg_size
-// const rs_radix_log2
-// const rs_radix_size
-// const rs_keyval_size
-// const rs_histogram_block_rows
-// const rs_scatter_block_rows
+// 实现 GPU Radix Sort 的计算着色器
+// 更多信息请参考 gpu_rs.rs 的开头部分
+// 
+// 注意：workgroup sizes 会在预处理阶段动态添加
+// 在管线启动前，以下常量定义会被预置到此着色器代码中：
+//
+// const histogram_sg_size : u32       // 直方图子组大小
+// const histogram_wg_size : u32       // 直方图工作组大小
+// const rs_radix_log2 : u32           // 基数对数 (通常为 8，即 256 进制)
+// const rs_radix_size : u32           // 基数大小 (2^8 = 256)
+// const rs_keyval_size : u32          // 键值大小 (32位键 / 8位基数 = 4 pass)
+// const rs_histogram_block_rows : u32 // 直方图块行数
+// const rs_scatter_block_rows : u32   // 散射块行数
 
 struct GeneralInfo{
-    keys_size: u32,
-    padded_size: u32,
-    passes: u32,
-    even_pass: u32,
-    odd_pass: u32,
+    keys_size: u32,     // 需要排序的键的总数
+    padded_size: u32,   // 填充后的大小
+    passes: u32,        // 总趟数 (通常为 4)
+    even_pass: u32,     // 当前是否为偶数趟 (0 或 1)
+    odd_pass: u32,      // 当前是否为奇数趟 (0 或 1)
 };
 
 @group(0) @binding(0)
 var<storage, read_write> infos: GeneralInfo;
 @group(0) @binding(1)
-var<storage, read_write> histograms : array<atomic<u32>>;
+var<storage, read_write> histograms : array<atomic<u32>>; // 全局直方图缓冲区
 @group(0) @binding(2)
-var<storage, read_write> keys : array<u32>;
+var<storage, read_write> keys : array<u32>;      // 输入键缓冲区 (Ping-Pong A)
 @group(0) @binding(3)
-var<storage, read_write> keys_b : array<u32>;
+var<storage, read_write> keys_b : array<u32>;    // 输出键缓冲区 (Ping-Pong B)
 @group(0) @binding(4)
-var<storage, read_write> payload_a : array<u32>;
+var<storage, read_write> payload_a : array<u32>; // 输入负载缓冲区 (Ping-Pong A，通常是索引)
 @group(0) @binding(5)
-var<storage, read_write> payload_b : array<u32>;
+var<storage, read_write> payload_b : array<u32>; // 输出负载缓冲区 (Ping-Pong B)
 
-// layout of the histograms buffer
+// 直方图缓冲区的内存布局：
 //   +---------------------------------+ <-- 0
-//   | histograms[keyval_size]         |
-//   +---------------------------------+ <-- keyval_size                           * histo_size
-//   | partitions[scatter_blocks_ru-1] |
-//   +---------------------------------+ <-- (keyval_size + scatter_blocks_ru - 1) * histo_size
-//   | workgroup_ids[keyval_size]      |
-//   +---------------------------------+ <-- (keyval_size + scatter_blocks_ru - 1) * histo_size + workgroup_ids_size
+//   | histograms[keyval_size]         | 每一趟的直方图数据
+//   +---------------------------------+ <-- keyval_size * histo_size
+//   | partitions[scatter_blocks_ru-1] | 散射阶段的分区前缀和
+//   +---------------------------------+ 
+//   | workgroup_ids[keyval_size]      | 
+//   +---------------------------------+ 
 
 // --------------------------------------------------------------------------------------------------------------
-// Filling histograms and keys with default values (also resets the pass infos for odd and even scattering)
+// 0. 初始化：将直方图清零，并填充默认键值（同时重置 pass 信息）
 // --------------------------------------------------------------------------------------------------------------
 @compute @workgroup_size({histogram_wg_size})
 fn zero_histograms(@builtin(global_invocation_id) gid : vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     if gid.x == 0u {
         infos.even_pass = 0u;
-        infos.odd_pass = 1u;    // has to be one, as on the first call to even pass + 1 % 2 is calculated
+        infos.odd_pass = 1u;    // 必须为 1，因为第一次调用 even pass 后会计算 (0+1)%2
     }
-    // here the histograms are set to zero and the partitions are set to 0xfffffffff to avoid sorting problems
+    
+    // 计算需要清零的范围
     let scatter_wg_size = histogram_wg_size;
     let scatter_block_kvs = scatter_wg_size * rs_scatter_block_rows;
     let scatter_blocks_ru = (infos.keys_size + scatter_block_kvs - 1u) / scatter_block_kvs;
@@ -59,10 +60,13 @@ fn zero_histograms(@builtin(global_invocation_id) gid : vec3<u32>, @builtin(num_
     let histo_size = rs_radix_size;
     var n = (rs_keyval_size + scatter_blocks_ru - 1u) * histo_size;
     let b = n;
+    
+    // 处理填充区域
     if infos.keys_size < infos.padded_size {
         n += infos.padded_size - infos.keys_size;
     }
     
+    // 并行清零
     let line_size = nwg.x * {histogram_wg_size}u;
     for (var cur_index = gid.x; cur_index < n; cur_index += line_size){
         if cur_index >= n {
@@ -76,40 +80,48 @@ fn zero_histograms(@builtin(global_invocation_id) gid : vec3<u32>, @builtin(num_
             atomicStore(&histograms[cur_index], 0u);
         }
         else {
+            // 将填充区域的键设置为最大值 (0xFFFFFFFF)，确保它们排序后排在最后
             keys[infos.keys_size + cur_index - b] = 0xFFFFFFFFu;
         }
     }
 }
 
 // --------------------------------------------------------------------------------------------------------------
-// Calculating the histograms
+// 1. 直方图计算阶段：统计每个基数桶中的元素数量
 // --------------------------------------------------------------------------------------------------------------
-var<workgroup> smem : array<atomic<u32>, rs_radix_size>;
-var<private> kv : array<u32, rs_histogram_block_rows>;
+var<workgroup> smem : array<atomic<u32>, rs_radix_size>; // 共享内存：本地直方图
+var<private> kv : array<u32, rs_histogram_block_rows>;   // 私有寄存器：当前线程处理的键
+
+// 清空共享内存
 fn zero_smem(lid: u32) {
     if lid < rs_radix_size {
         atomicStore(&smem[lid], 0u);
     }
 }
 
+// 处理一个 pass 的直方图统计
 fn histogram_pass(pass_: u32, lid: u32) {
     zero_smem(lid);
     workgroupBarrier();
     
+    // 统计当前线程持有的键的基数
     for (var j = 0u; j < rs_histogram_block_rows; j++) {
         let u_val = bitcast<u32>(kv[j]);
+        // 提取当前 pass 对应的 8 位基数
         let digit = extractBits(u_val, pass_ * rs_radix_log2, rs_radix_log2);
         atomicAdd(&smem[digit], 1u);
     }
     
     workgroupBarrier();
+    
+    // 将本地直方图累加到全局直方图
     let histogram_offset = rs_radix_size * pass_ + lid;
     if lid < rs_radix_size && atomicLoad(&smem[lid]) >= 0u {
         atomicAdd(&histograms[histogram_offset], atomicLoad(&smem[lid]));
     }
 }
 
-// the workgrpu_size can be gotten on the cpu by by calling pipeline.get_bind_group_layout(0).unwrap().get_local_workgroup_size();
+// 从全局内存加载键到寄存器
 fn fill_kv(wid: u32, lid: u32) {
     let rs_block_keyvals : u32 = rs_histogram_block_rows * histogram_wg_size;
     let kv_in_offset = wid * rs_block_keyvals + lid;
@@ -118,20 +130,13 @@ fn fill_kv(wid: u32, lid: u32) {
         kv[i] = keys[pos];
     }
 }
-fn fill_kv_keys_b(wid: u32, lid: u32) {
-    let rs_block_keyvals : u32 = rs_histogram_block_rows * histogram_wg_size;
-    let kv_in_offset = wid * rs_block_keyvals + lid;
-    for (var i = 0u; i < rs_histogram_block_rows; i++) {
-        let pos = kv_in_offset + i * histogram_wg_size;
-        kv[i] = keys_b[pos];
-    }
-}
+
 @compute @workgroup_size({histogram_wg_size})
 fn calculate_histogram(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>) {
-    // efficient loading of multiple values
+    // 高效加载多个值
     fill_kv(wid.x, lid.x);
     
-    // Accumulate and store histograms for passes
+    // 为每个 pass 累积并存储直方图 (这里硬编码了 4 个 pass，对应 32 位键)
     histogram_pass(3u, lid.x);
     histogram_pass(2u, lid.x);
     // if infos.passes > 2u {
@@ -143,26 +148,28 @@ fn calculate_histogram(@builtin(workgroup_id) wid : vec3<u32>, @builtin(local_in
 }
 
 // --------------------------------------------------------------------------------------------------------------
-// Prefix sum over histogram
+// 2. 前缀和计算阶段 (Prefix Sum / Scan)：计算全局偏移量
 // --------------------------------------------------------------------------------------------------------------
+// 在共享内存中进行前缀和归约
 fn prefix_reduce_smem(lid: u32) {
     var offset = 1u;
-    for (var d = rs_radix_size >> 1u; d > 0u; d = d >> 1u) { // sum in place tree
+    // 上行阶段 (Up-Sweep)
+    for (var d = rs_radix_size >> 1u; d > 0u; d = d >> 1u) { 
         workgroupBarrier();
         if lid < d {
             let ai = offset * (2u * lid + 1u) - 1u;
             let bi = offset * (2u * lid + 2u) - 1u;
-            // smem[bi] += smem[ai];
             atomicAdd(&smem[bi], atomicLoad(&smem[ai]));
         }
         offset = offset << 1u;
     }
     
+    // 清除最后一个元素
     if lid == 0u { 
-        // smem[rs_radix_size - 1u] = 0u;
         atomicStore(&smem[rs_radix_size - 1u], 0u);
-    } // clear the last element
+    } 
         
+    // 下行阶段 (Down-Sweep)
     for (var d = 1u; d < rs_radix_size; d = d << 1u) {
         offset = offset >> 1u;
         workgroupBarrier();
@@ -170,50 +177,40 @@ fn prefix_reduce_smem(lid: u32) {
             let ai = offset * (2u * lid + 1u) - 1u;
             let bi = offset * (2u * lid + 2u) - 1u;
             
-            // let t = smem[ai];
             let t     = atomicLoad(&smem[ai]);
-            // smem[ai]  = smem[bi];
             atomicStore(&smem[ai], atomicLoad(&smem[bi]));
-            // smem[bi] += t;
             atomicAdd(&smem[bi], t);
         }
     }
 }
+
 @compute @workgroup_size({prefix_wg_size})
 fn prefix_histogram(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid : vec3<u32>) {
-    // the work group  id is the pass, and is inverted in the next line, such that pass 3 is at the first position in the histogram buffer
+    // workgroup id 对应 pass，这里进行了倒序映射，使得 pass 3 在 buffer 的第一个位置
     let histogram_base = (rs_keyval_size - 1u - wid.x) * rs_radix_size;
     let histogram_offset = histogram_base + lid.x;
     
-    // the following coode now corresponds to the prefix calc code in fuchsia/../shaders/prefix.h
-    // however the implementation is taken from https://www.eecs.umich.edu/courses/eecs570/hw/parprefix.pdf listing 2 (better overview, nw subgroup arithmetic)
-    // this also means that only half the amount of workgroups is spawned (one workgroup calculates for 2 positioons)
-    // the smemory is used from the previous section
-    // smem[lid.x] = histograms[histogram_offset];
+    // 加载直方图数据到共享内存
+    // 每个线程负责加载 2 个数据，因为 prefix_wg_size = radix_size / 2
     atomicStore(&smem[lid.x], atomicLoad(&histograms[histogram_offset]));
-    // smem[lid.x + {prefix_wg_size}u] = histograms[histogram_offset + {prefix_wg_size}u];
     atomicStore(&smem[lid.x + {prefix_wg_size}u], atomicLoad(&histograms[histogram_offset + {prefix_wg_size}u]));
 
+    // 执行前缀和
     prefix_reduce_smem(lid.x);
     workgroupBarrier();
     
-    // histograms[histogram_offset] = smem[lid.x];
+    // 将结果写回全局内存
     atomicStore(&histograms[histogram_offset], atomicLoad(&smem[lid.x]));
-    // histograms[histogram_offset + {prefix_wg_size}u] = smem[lid.x + {prefix_wg_size}u];
     atomicStore(&histograms[histogram_offset + {prefix_wg_size}u], atomicLoad(&smem[lid.x + {prefix_wg_size}u]));
 }
 
 // --------------------------------------------------------------------------------------------------------------
-// Scattering the keys
+// 3. 散射阶段 (Scatter)：将键值移动到排序后的位置
 // --------------------------------------------------------------------------------------------------------------
-// General note: Only 2 sweeps needed here
-var<workgroup> scatter_smem: array<u32, rs_mem_dwords>; // note: rs_mem_dwords is caclulated in the beginngin of gpu_rs.rs
-//            | Dwords                                    | Bytes
-//  ----------+-------------------------------------------+--------
-//  Lookback  | 256                                       | 1 KB
-//  Histogram | 256                                       | 1 KB
-//  Prefix    | 4-84                                      | 16-336
-//  Reorder   | RS_WORKGROUP_SIZE * RS_SCATTER_BLOCK_ROWS | 2-8 KB
+// 注意：这里需要大量的共享内存
+var<workgroup> scatter_smem: array<u32, rs_mem_dwords>; 
+
+// 辅助函数定义
 fn partitions_base_offset() -> u32 { return rs_keyval_size * rs_radix_size;}
 fn smem_prefix_offset() -> u32 { return rs_radix_size + rs_radix_size;}
 fn rs_prefix_sweep_0(idx: u32) -> u32 { return scatter_smem[smem_prefix_offset() + rs_mem_sweep_0_offset + idx];}
@@ -223,19 +220,18 @@ fn rs_prefix_load(lid: u32, idx: u32) -> u32 { return scatter_smem[rs_radix_size
 fn rs_prefix_store(lid: u32, idx: u32, val: u32) { scatter_smem[rs_radix_size + lid + idx] = val;}
 fn is_first_local_invocation(lid: u32) -> bool { return lid == 0u;}
 fn histogram_load(digit: u32) -> u32 {
-    //  return smem[digit];
     return atomicLoad(&smem[digit]);
-}// scatter_smem[rs_radix_size + digit];}
-
+}
 fn histogram_store(digit: u32, count: u32) { 
-    // smem[digit] = count;
     atomicStore(&smem[digit], count);
-} // scatter_smem[rs_radix_size + digit] = count; }
-const rs_partition_mask_status : u32 = 0xC0000000u;
-const rs_partition_mask_count : u32 = 0x3FFFFFFFu;
-var<private> kr : array<u32, rs_scatter_block_rows>;
-var<private> pv : array<u32, rs_scatter_block_rows>;
+} 
 
+const rs_partition_mask_status : u32 = 0xC0000000u; // 分区状态掩码
+const rs_partition_mask_count : u32 = 0x3FFFFFFFu;  // 分区计数掩码
+var<private> kr : array<u32, rs_scatter_block_rows>; // 键的 rank
+var<private> pv : array<u32, rs_scatter_block_rows>; // 负载 (Payload)
+
+// 从 keys 加载数据 (偶数 pass)
 fn fill_kv_even(wid: u32, lid: u32) {
     let subgroup_id = lid / histogram_sg_size;
     let subgroup_invoc_id = lid - subgroup_id * histogram_sg_size;
@@ -251,6 +247,8 @@ fn fill_kv_even(wid: u32, lid: u32) {
         pv[i] = payload_a[pos];
     }
 }
+
+// 从 keys_b 加载数据 (奇数 pass)
 fn fill_kv_odd(wid: u32, lid: u32) {
     let subgroup_id = lid / histogram_sg_size;
     let subgroup_invoc_id = lid - subgroup_id * histogram_sg_size;
@@ -266,31 +264,30 @@ fn fill_kv_odd(wid: u32, lid: u32) {
         pv[i] = payload_b[pos];
     }
 }
+
+// 核心散射逻辑
 fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3<u32>, partition_status_invalid: u32, partition_status_reduction: u32, partition_status_prefix: u32) {
     let partition_mask_invalid = partition_status_invalid << 30u;
     let partition_mask_reduction = partition_status_reduction << 30u;
     let partition_mask_prefix = partition_status_prefix << 30u;
-    // kv_filling is done in the scatter_even and scatter_odd functions to account for front and backbuffer switch
-    // in the reference there is a nulling of the smmem here, was moved to line 251 as smem is used in the code until then
 
-    // The following implements conceptually the same as the
-    // Emulate a "match" operation with broadcasts for small subgroup sizes (line 665 ff in scatter.glsl)
-    // The difference however is, that instead of using subrgoupBroadcast each thread stores
-    // its current number in the smem at lid.x, and then looks up their neighbouring values of the subgroup
+    // 1. 本地直方图计算和排名 (Local Ranking)
+    // 模拟子组广播操作，计算每个键在子组内的排名
     let subgroup_id = lid.x / histogram_sg_size;
     let subgroup_offset = subgroup_id * histogram_sg_size;
     let subgroup_tid = lid.x - subgroup_offset;
     let subgroup_count = {scatter_wg_size}u / histogram_sg_size;
+    
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         let u_val = bitcast<u32>(kv[i]);
         let digit = extractBits(u_val, pass_ * rs_radix_log2, rs_radix_log2);
-        // smem[lid.x] = digit;
+        
         atomicStore(&smem[lid.x], digit);
         var count = 0u;
         var rank = 0u;
         
+        // 遍历子组内的所有线程，统计当前 digit 的出现次数和排名
         for (var j = 0u; j < histogram_sg_size; j++) {
-            // if smem[subgroup_offset + j] == digit {
             if atomicLoad(&smem[subgroup_offset + j]) == digit {
                 count += 1u;
                 if j <= subgroup_tid {
@@ -299,13 +296,14 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
             }
         }
         
+        // 存储结果：高16位为总数，低16位为排名
         kr[i] = (count << 16u) | rank;
     }
     
-    zero_smem(lid.x);   // now zeroing the smmem as we are now accumulating the histogram there
+    zero_smem(lid.x);   
     workgroupBarrier();
 
-    // The final histogram is stored in the smem buffer
+    // 2. 计算工作组内的直方图 (Workgroup Histogram)
     for (var i = 0u; i < subgroup_count; i++) {
         if subgroup_id == i {
             for (var j = 0u; j < rs_scatter_block_rows; j++) {
@@ -314,88 +312,83 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
                 let prev = histogram_load(digit);
                 let rank = kr[j] & 0xFFFFu;
                 let count = kr[j] >> 16u;
+                
+                // 更新 kr 为局部偏移量
                 kr[j] = prev + rank;
 
                 if rank == count {
                     histogram_store(digit, (prev + count));
                 }
-                
-                // TODO: check if the barrier here is needed
             }            
         }
         workgroupBarrier();
     }
-    // kr filling is now done and contains the total offset for each value to be able to 
-    // move the values into order without having any collisions
     
-    // we do not check for single work groups (is currently not assumed to occur very often)
-    let partition_offset = lid.x + partitions_base_offset();    // is correct, the partitions pointer does not change
+    // 3. 链式扫描 (Chained Scan) / Lookback
+    // 计算当前工作组的全局偏移量
+    let partition_offset = lid.x + partitions_base_offset();
     let partition_base = wid.x * rs_radix_size;
+    
     if wid.x == 0u {
-        // special treating for the first workgroup as the data might be read back by later workgroups
-        // corresponds to rs_first_prefix_store
+        // 第一个工作组：直接存储前缀和
         let hist_offset = pass_ * rs_radix_size + lid.x;
         if lid.x < rs_radix_size {
-            // let exc = histograms[hist_offset];
             let exc = atomicLoad(&histograms[hist_offset]);
-            let red = histogram_load(lid.x);// scatter_smem[rs_keyval_size + lid.x];
+            let red = histogram_load(lid.x);
             
             scatter_smem[lid.x] = exc;
             
             let inc = exc + red;
-
             atomicStore(&histograms[partition_offset], inc | partition_mask_prefix);
         }
     }
     else {
-        // standard case for the "inbetween" workgroups
+        // 后续工作组：需要查找前序工作组的状态
         
-        // rs_reduction_store, only for inbetween workgroups
+        // 存储 reduction 状态
         if lid.x < rs_radix_size && wid.x < nwg.x - 1u {
             let red = histogram_load(lid.x);
             atomicStore(&histograms[partition_offset + partition_base], red | partition_mask_reduction);
         }
         
-        // rs_loopback_store
+        // Lookback 循环：向前查找直到找到 PREFIX 状态，并累加中间的 REDUCTION
         if lid.x < rs_radix_size {
             var partition_base_prev = partition_base - rs_radix_size;
             var exc                 = 0u;
 
-            // Note: Each workgroup invocation can proceed independently.
-            // Subgroups and workgroups do NOT have to coordinate.
             while true {
-                //let prev = atomicLoad(&histograms[partition_offset]);// histograms[partition_offset + partition_base_prev];
-                let prev = atomicLoad(&histograms[partition_base_prev + partition_offset]);// histograms[partition_offset + partition_base_prev];
+                let prev = atomicLoad(&histograms[partition_base_prev + partition_offset]);
+                
+                // 状态无效，自旋等待
                 if (prev & rs_partition_mask_status) == partition_mask_invalid {
                     continue;
                 }
+                
                 exc += prev & rs_partition_mask_count;
+                
+                // 如果是 REDUCTION 状态，继续向前
                 if (prev & rs_partition_mask_status) != partition_mask_prefix {
-                    // continue accumulating reduction
                     partition_base_prev -= rs_radix_size;
                     continue;
                 }
 
-                // otherwise save the exclusive scan and atomically transform the
-                // reduction into an inclusive prefix status math: reduction + 1 = prefix
+                // 找到 PREFIX 状态，计算结束
                 scatter_smem[lid.x] = exc;
 
-                if wid.x < nwg.x - 1u { // only store when inbetween, skip for last workgrup
+                // 如果不是最后一个工作组，更新当前状态为 PREFIX
+                if wid.x < nwg.x - 1u { 
                     atomicAdd(&histograms[partition_offset + partition_base], exc | (1u << 30u));
                 }
                 break;
             }
         }
     }
-    // speial case for last workgroup is also done in the "inbetween" case
     
-    // compute exclusive prefix scan of histogram
-    // corresponds to rs_prefix
-    // TODO make shure that the data is put into smem
+    // 4. 计算本地独占前缀和
     prefix_reduce_smem(lid.x);
     workgroupBarrier();
 
-    // convert keyval rank to local index, corresponds to rs_rank_to_local
+    // 5. 将键值排名转换为本地索引
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         let v = bitcast<u32>(kv[i]);
         let digit = extractBits(v, pass_ * rs_radix_log2, rs_radix_log2);
@@ -406,53 +399,44 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
     }
     workgroupBarrier();
     
-    // reorder kv[] and kr[], corresponds to rs_reorder
+    // 6. 重新排序 (Reorder)
+    // 利用共享内存将键值和 Payload 交换到正确顺序
     let smem_reorder_offset = rs_radix_size;
-    let smem_base = smem_reorder_offset + lid.x;  // as we are in smem, the radix_size offset is not needed
+    let smem_base = smem_reorder_offset + lid.x;
   
-        // keyvalues ----------------------------------------------
-        // store keyval to sorted location
-        for (var j = 0u; j < rs_scatter_block_rows; j++) {
-            let smem_idx = smem_reorder_offset + (kr[j] >> 16u) - 1u;
-            
-            scatter_smem[smem_idx] = bitcast<u32>(kv[j]);
-        }
-        workgroupBarrier();
-
-        // Load keyval dword from sorted location
-        for (var j = 0u; j < rs_scatter_block_rows; j++) {
-            kv[j] = scatter_smem[smem_base + j * {scatter_wg_size}u];
-        }
-        workgroupBarrier();
-        // payload ----------------------------------------------
-        // store payload to sorted location
-        for (var j = 0u; j < rs_scatter_block_rows; j++) {
-            let smem_idx = smem_reorder_offset + (kr[j] >> 16u) - 1u;
-            
-            scatter_smem[smem_idx] = pv[j];
-        }
-        workgroupBarrier();
-
-        // Load payload dword from sorted location
-        for (var j = 0u; j < rs_scatter_block_rows; j++) {
-            pv[j] = scatter_smem[smem_base + j * {scatter_wg_size}u];
-        }
-        workgroupBarrier();
-    //}
+    // --- 键值 ---
+    for (var j = 0u; j < rs_scatter_block_rows; j++) {
+        let smem_idx = smem_reorder_offset + (kr[j] >> 16u) - 1u;
+        scatter_smem[smem_idx] = bitcast<u32>(kv[j]);
+    }
+    workgroupBarrier();
+    for (var j = 0u; j < rs_scatter_block_rows; j++) {
+        kv[j] = scatter_smem[smem_base + j * {scatter_wg_size}u];
+    }
+    workgroupBarrier();
     
-    // store the digit-index to sorted location
+    // --- Payload ---
+    for (var j = 0u; j < rs_scatter_block_rows; j++) {
+        let smem_idx = smem_reorder_offset + (kr[j] >> 16u) - 1u;
+        scatter_smem[smem_idx] = pv[j];
+    }
+    workgroupBarrier();
+    for (var j = 0u; j < rs_scatter_block_rows; j++) {
+        pv[j] = scatter_smem[smem_base + j * {scatter_wg_size}u];
+    }
+    workgroupBarrier();
+    
+    // --- 排名 ---
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         let smem_idx = smem_reorder_offset + (kr[i] >> 16u) - 1u;
         scatter_smem[smem_idx] = kr[i];
     }
     workgroupBarrier();
-
-    // Load kr[] from sorted location -- we only need the rank
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         kr[i] = scatter_smem[smem_base + i * {scatter_wg_size}u] & 0xFFFFu;
     }
     
-    // convert local index to a global index, corresponds to rs_local_to_global
+    // 7. 将本地索引转换为全局索引
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         let v = bitcast<u32>(kv[i]);
         let digit = extractBits(v, pass_ * rs_radix_log2, rs_radix_log2);
@@ -460,17 +444,17 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
 
         kr[i] += exc - 1u;
     }
-    
-    // the storing is done in the scatter_even and scatter_odd functions as the front and back buffer changes
 }
+
+// 偶数 Pass 的散射入口
 @compute @workgroup_size({scatter_wg_size})
 fn scatter_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     if gid.x == 0u {
-        infos.odd_pass = (infos.odd_pass + 1u) % 2u; // for this to work correctly the odd_pass has to start 1
+        infos.odd_pass = (infos.odd_pass + 1u) % 2u; // 更新下一次 Pass 的标志
     }
     let cur_pass = infos.even_pass * 2u;
     
-    // load from keys, store to keys_b
+    // 从 keys 读取，写入 keys_b
     fill_kv_even(wid.x, lid.x);
     
     let partition_status_invalid = 0u;
@@ -478,7 +462,7 @@ fn scatter_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
     let partition_status_prefix = 2u;
     scatter(cur_pass, lid, gid, wid, nwg, partition_status_invalid, partition_status_reduction, partition_status_prefix);
 
-    // store keyvals to their new locations, corresponds to rs_store
+    // 写入结果到全局内存
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         keys_b[kr[i]] = kv[i];
     }
@@ -486,14 +470,16 @@ fn scatter_even(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation
         payload_b[kr[i]] = pv[i];
     }
 }
+
+// 奇数 Pass 的散射入口
 @compute @workgroup_size({scatter_wg_size})
 fn scatter_odd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>, @builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgroups) nwg: vec3<u32>) {
     if gid.x == 0u {
-        infos.even_pass = (infos.even_pass + 1u) % 2u; // for this to work correctly the even_pass has to start at 0
+        infos.even_pass = (infos.even_pass + 1u) % 2u; 
     }
     let cur_pass = infos.odd_pass * 2u + 1u;
 
-    // load from keys_b, store to keys
+    // 从 keys_b 读取，写入 keys
     fill_kv_odd(wid.x, lid.x);
 
     let partition_status_invalid = 2u;
@@ -501,13 +487,11 @@ fn scatter_odd(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_
     let partition_status_prefix = 0u;
     scatter(cur_pass, lid, gid, wid, nwg, partition_status_invalid, partition_status_reduction, partition_status_prefix);
 
-    // store keyvals to their new locations, corresponds to rs_store
+    // 写入结果到全局内存
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         keys[kr[i]] = kv[i];
     }
     for (var i = 0u; i < rs_scatter_block_rows; i++) {
         payload_a[kr[i]] = pv[i];
     }
-
-    // the indirect buffer is reset after scattering via write buffer, see record_scatter_indirect for details
 }
