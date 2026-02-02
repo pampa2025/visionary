@@ -152,7 +152,11 @@ export class ONNXModelTester {
         const cameraMatrix = mat4.create();
         mat4.identity(cameraMatrix);
         
-        feeds[inputName] = new ort.Tensor('float32', cameraMatrix, [4, 4]);
+        feeds[inputName] = new ort.Tensor(
+					'float32',
+					cameraMatrix as Float32Array,
+					[4, 4],
+				);
         console.log(`  📷 Created camera matrix for '${inputName}'`);
         
       } else if (inputName.toLowerCase().includes('time') || inputName.toLowerCase().includes('t')) {
@@ -166,7 +170,11 @@ export class ONNXModelTester {
         const projMatrix = mat4.create();
         mat4.perspective(projMatrix, Math.PI / 4, 16/9, 0.1, 1000);
         
-        feeds[inputName] = new ort.Tensor('float32', projMatrix, [4, 4]);
+        feeds[inputName] = new ort.Tensor(
+					'float32',
+					projMatrix as Float32Array,
+					[4, 4],
+				);
         console.log(`  📐 Created projection matrix for '${inputName}'`);
         
       } else {
@@ -264,7 +272,11 @@ export class ONNXModelTester {
     );
     
     if (cameraInputName) {
-      feeds[cameraInputName] = new ort.Tensor('float32', viewMatrix, [4, 4]);
+      feeds[cameraInputName] = new ort.Tensor(
+				'float32',
+				viewMatrix as Float32Array,
+				[4, 4],
+			);
     }
 
     const results = await this.session.run(feeds);
