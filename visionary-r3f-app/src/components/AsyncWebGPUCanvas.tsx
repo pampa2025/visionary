@@ -21,6 +21,9 @@ export function AsyncWebGPUCanvas({
 }: AsyncWebGPUCanvasProps) {
   const [status, setStatus] = useState<'checking' | 'initializing' | 'ready' | 'error'>('checking')
   const [errorMessage, setErrorMessage] = useState<string>('')
+  const [frameloop, setFrameloop] = useState<'always' | 'demand' | 'never'>(
+		'never',
+	);
 
   // 1. Check WebGPU support first
   useEffect(() => {
@@ -68,6 +71,7 @@ export function AsyncWebGPUCanvas({
     renderer.init().then(() => {
       renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
       setStatus('ready')
+      setFrameloop('always');
       onInitialized?.(renderer)
       console.log('WebGPU initialized successfully')
     }).catch((error: Error) => {
@@ -128,30 +132,33 @@ export function AsyncWebGPUCanvas({
 
   // Initializing or Ready State
   return (
-    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-      {status === 'initializing' && (
-        <div style={{
-          position: 'absolute',
-          inset: 0,
-          zIndex: 10,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          background: '#1a1a1a',
-          color: '#fff'
-        }}>
-          {loading || <div>Initializing WebGPU Renderer...</div>}
-        </div>
-      )}
-      <Canvas
-        gl={createRenderer}
-        onCreated={({ gl }) => {
-           // Any additional setup if needed
-        }}
-        {...props}
-      >
-        {status === 'ready' ? children : null}
-      </Canvas>
-    </div>
-  )
+		<div style={{ position: 'relative', width: '100%', height: '100%' }}>
+			{status === 'initializing' && (
+				<div
+					style={{
+						position: 'absolute',
+						inset: 0,
+						zIndex: 10,
+						display: 'flex',
+						alignItems: 'center',
+						justifyContent: 'center',
+						background: '#1a1a1a',
+						color: '#fff',
+					}}
+				>
+					{loading || <div>Initializing WebGPU Renderer...</div>}
+				</div>
+			)}
+			<Canvas
+				frameloop={frameloop}
+				gl={createRenderer}
+				onCreated={({ gl }) => {
+					// Any additional setup if needed
+				}}
+				{...props}
+			>
+				{status === 'ready' ? children : null}
+			</Canvas>
+		</div>
+	);
 }
