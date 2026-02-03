@@ -43,3 +43,8 @@ datasets/
 package-lock.json
 
 models/
+**/*.DS_Store
+.DS_Store
+onnx-export/.DS_Store
+onnx-export/ONNXExample-Avatar/.DS_Store
+src/.DS_Store
