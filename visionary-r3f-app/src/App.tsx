@@ -1,4 +1,4 @@
-import { useThree, extend, ReactThreeFiber } from '@react-three/fiber';
+// import { useThree, extend, ReactThreeFiber } from '@react-three/fiber';
 import './App.css';
 import { Box, OrbitControls } from '@react-three/drei';
 import { AsyncWebGPUCanvas } from './components/AsyncWebGPUCanvas';
