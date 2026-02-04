@@ -310,14 +310,15 @@ export class GaussianModel extends THREE.Object3D {
      */
     public setModelVisible(value: boolean): void {
         this.visible = value; // Object3D.visible
-        this.mEntry.visible = value;
+        if (this.mEntry) this.mEntry.visible = value;
     }
 
     /**
      * Get model visibility (checks both Object3D and ModelEntry)
      */
     public getModelVisible(): boolean {
-        return this.mEntry.visible && this.visible;
+        // Prioritize Object3D.visible as it's the source of truth for rendering
+        return this.visible;
     }
 
     /**
@@ -325,7 +326,9 @@ export class GaussianModel extends THREE.Object3D {
      * Currently always returns true - can be enhanced with proper frustum culling
      */
     public isVisible(camera: THREE.Camera): boolean {
-        return this.getModelVisible();
+        // Simple check: if Object3D is visible, it's visible
+        // We can add frustum culling here later if needed
+        return this.visible;
     }
 
     // ============ Auto-Sync Control ============

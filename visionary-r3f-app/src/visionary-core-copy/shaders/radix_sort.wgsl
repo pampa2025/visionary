@@ -283,6 +283,8 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
         let digit = extractBits(u_val, pass_ * rs_radix_log2, rs_radix_log2);
         
         atomicStore(&smem[lid.x], digit);
+        workgroupBarrier(); // Ensure all threads have written their digit
+
         var count = 0u;
         var rank = 0u;
         
@@ -295,6 +297,7 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
                 }
             }
         }
+        workgroupBarrier(); // Ensure all threads have read before next iteration writes
         
         // 存储结果：高16位为总数，低16位为排名
         kr[i] = (count << 16u) | rank;
@@ -305,8 +308,8 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
 
     // 2. 计算工作组内的直方图 (Workgroup Histogram)
     for (var i = 0u; i < subgroup_count; i++) {
-        if subgroup_id == i {
-            for (var j = 0u; j < rs_scatter_block_rows; j++) {
+        for (var j = 0u; j < rs_scatter_block_rows; j++) {
+            if subgroup_id == i {
                 let v = bitcast<u32>(kv[j]);
                 let digit = extractBits(v, pass_ * rs_radix_log2, rs_radix_log2);
                 let prev = histogram_load(digit);
@@ -319,9 +322,9 @@ fn scatter(pass_: u32, lid: vec3<u32>, gid: vec3<u32>, wid: vec3<u32>, nwg: vec3
                 if rank == count {
                     histogram_store(digit, (prev + count));
                 }
-            }            
+            }
+            workgroupBarrier();
         }
-        workgroupBarrier();
     }
     
     // 3. 链式扫描 (Chained Scan) / Lookback

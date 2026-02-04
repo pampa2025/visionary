@@ -9,7 +9,7 @@ import { FBXModelWrapper } from '../models/fbx-model-wrapper';
 export class GaussianThreeJSRenderer extends THREE.Mesh {
 	private renderer: GaussianRenderer;
 	private gaussianModels: GaussianModel[];
-	private pcs: (PointCloud | DynamicPointCloud)[] | null = null;
+	private pcs: (PointCloud | DynamicPointCloud)[] = [];
 
 	// Three.js integration
 	private threeRenderer: THREE.WebGPURenderer;
@@ -33,12 +33,19 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 	private overlayPipeline: GPURenderPipeline | null = null;
 	private overlayRenderedThisFrame = false;
 
+	private static instanceCount = 0;
+	public readonly instanceId: number;
+
 	public constructor(
 		renderer: THREE.WebGPURenderer,
 		scene: THREE.Scene,
 		gaussianModels: GaussianModel[],
 	) {
 		super();
+		this.instanceId = ++GaussianThreeJSRenderer.instanceCount;
+		console.log(
+			`[GaussianThreeJSRenderer] Constructor called. Instance ID: ${this.instanceId}. Initial models: ${gaussianModels.length}`,
+		);
 
 		// Important: ensure this helper mesh is never frustum-culled by Three.js.
 		// If it's culled (common because it has no geometry bounds), onBeforeRender
@@ -52,12 +59,39 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 		this.renderer = new GaussianRenderer(this.device, format, 3);
 		this.gaussianModels = gaussianModels;
 		this.canvasFormat = format;
+
+		// Add dummy geometry and material to ensure onBeforeRender is called
+		this.geometry = new THREE.BoxGeometry(0.1, 0.1, 0.1);
+		this.material = new THREE.MeshBasicMaterial({
+			color: 0x000000,
+			transparent: true,
+			opacity: 0,
+			depthWrite: false,
+		});
 	}
 
 	public addModel(model: GaussianModel): void {
 		this.gaussianModels.push(model);
 		// Also add to the scene graph so it gets updated
 		this.add(model);
+		console.log(
+			`[GaussianThreeJSRenderer #${this.instanceId}] addModel: Added ${model.name}. Total models: ${this.gaussianModels.length}. Visible: ${model.visible}. Object3D ID: ${model.id}`,
+		);
+	}
+
+	public removeModel(model: GaussianModel): void {
+		const index = this.gaussianModels.indexOf(model);
+		if (index !== -1) {
+			this.gaussianModels.splice(index, 1);
+			console.log(
+				`[GaussianThreeJSRenderer #${this.instanceId}] removeModel: Removed ${model.name}. Remaining models: ${this.gaussianModels.length}`,
+			);
+		} else {
+			console.warn(
+				`[GaussianThreeJSRenderer #${this.instanceId}] removeModel: Model ${model.name} not found in list!`,
+			);
+		}
+		this.remove(model);
 	}
 
 	public onResize(width: number, height: number, _forceUpdate?: boolean): void {
@@ -345,6 +379,9 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 		_material?: any,
 		_group?: any,
 	) {
+		if ((globalThis as any).GS_DEBUG_FLAG) {
+			console.log('GaussianThreeJSRenderer.onBeforeRender called');
+		}
 		// 检查相机类型，兼容不同的Three.js导入方式
 		if (
 			!(camera instanceof THREE.PerspectiveCamera) &&
@@ -355,28 +392,81 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 		}
 
 		const cam = this.convertCamera(camera as any, renderer as any);
+
+		// Debug: Log all models status (Unconditional log if we have models but 0 visible)
+		if (
+			(globalThis as any).GS_DEBUG_FLAG ||
+			(this.gaussianModels.length > 0 &&
+				this.gaussianModels.filter((m) => m.isVisible(camera)).length === 0)
+		) {
+			console.log(
+				`[GaussianThreeJSRenderer #${this.instanceId}] onBeforeRender: Total models: ${this.gaussianModels.length}. Scene UUID: ${scene.uuid}. My Parent: ${this.parent ? this.parent.uuid : 'null'}`,
+			);
+			this.gaussianModels.forEach((m, i) => {
+				console.log(
+					`  Model ${i}: ${m.name}, visible=${m.visible}, isVisible()=${m.isVisible(camera)}, parent=${m.parent ? m.parent.type : 'null'}`,
+				);
+			});
+		}
+
 		const visibleModels = this.gaussianModels.filter((model) =>
 			model.isVisible(camera),
 		);
-		// 只过滤高斯模型（PointCloud/DynamicPointCloud），FBX模型不参与高斯渲染
-		// 注意：使用鸭子类型检查而不是instanceof，因为构建后的类名会被minify
-		this.pcs = visibleModels
-			.map((m) => m.getPointCloud())
-			.filter((pc): pc is PointCloud | DynamicPointCloud => {
-				// 检查是否有PointCloud的特征方法/属性
-				return (
-					pc &&
-					typeof pc === 'object' &&
-					('numPoints' in pc || 'countBuffer' in pc) &&
-					!('skeletalAnimation' in pc || 'fbxMesh' in pc)
-				); // 排除FBX模型
-			});
+		try {
+			// 只过滤高斯模型（PointCloud/DynamicPointCloud），FBX模型不参与高斯渲染
+			// 注意：使用鸭子类型检查而不是instanceof，因为构建后的类名会被minify
+			this.pcs = visibleModels
+				.map((m) => {
+					const pc = m.getPointCloud();
+					if ((globalThis as any).GS_DEBUG_FLAG) {
+						console.log(
+							`[GaussianThreeJSRenderer #${this.instanceId}] Mapping model ${m.name} to PointCloud. PC exists: ${!!pc}`,
+						);
+					}
+					return pc;
+				})
+				.filter((pc): pc is PointCloud | DynamicPointCloud => {
+					const isValid =
+						pc &&
+						typeof pc === 'object' &&
+						('numPoints' in pc || 'countBuffer' in pc) &&
+						!('skeletalAnimation' in pc || 'fbxMesh' in pc);
+					if (!isValid && (globalThis as any).GS_DEBUG_FLAG) {
+						console.warn(
+							`[GaussianThreeJSRenderer #${this.instanceId}] Filtered out invalid PointCloud for model.`,
+							pc,
+						);
+					}
+					return isValid;
+				});
+
+			if ((globalThis as any).GS_DEBUG_FLAG) {
+				console.log(
+					`[GaussianThreeJSRenderer #${this.instanceId}] onBeforeRender: pcs populated. Length: ${this.pcs.length}`,
+				);
+			}
+		} catch (error) {
+			console.error(
+				`[GaussianThreeJSRenderer #${this.instanceId}] Error populating pcs:`,
+				error,
+			);
+			this.pcs = [];
+		}
 
 		// Check if there are any points to render
 		const totalPoints = this.pcs.reduce((sum, pc) => sum + pc.numPoints, 0);
 
-		if (!this.pcs || this.pcs.length === 0 || totalPoints === 0) {
-			if ((globalThis as any).GS_VIDEO_EXPORT_DEBUG) {
+		if ((globalThis as any).GS_DEBUG_FLAG) {
+			console.log(
+				`[GaussianThreeJSRenderer #${this.instanceId}] drawSplats: Rendering ${this.pcs.length} point clouds with ${totalPoints} points.`,
+			);
+		}
+
+		if (this.pcs.length === 0 || totalPoints === 0) {
+			if (
+				(globalThis as any).GS_VIDEO_EXPORT_DEBUG ||
+				(globalThis as any).GS_DEBUG_FLAG
+			) {
 				console.warn(
 					'[GaussianThreeJSRenderer] onBeforeRender: 没有可见的高斯点云',
 				);
@@ -388,6 +478,7 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 					'[GaussianThreeJSRenderer] - visibleModels数量:',
 					visibleModels.length,
 				);
+
 				visibleModels.forEach((model, index) => {
 					const pc = model.getPointCloud();
 					console.log(
@@ -443,11 +534,31 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 		_material?: any,
 		_group?: any,
 	) {
-		if (this.pcs == null || this.pcs.length === 0) {
-			if ((globalThis as any).GS_VIDEO_EXPORT_DEBUG) {
-				console.warn('[GaussianThreeJSRenderer] drawSplats: pcs为空或长度为0');
-			}
+		if ((globalThis as any).GS_DEBUG_FLAG) {
+			console.log('GaussianThreeJSRenderer.drawSplats called');
+		}
 
+		if (this.pcs.length === 0) {
+			if ((globalThis as any).GS_VIDEO_EXPORT_DEBUG) {
+				console.warn(
+					`[GaussianThreeJSRenderer #${this.instanceId}] drawSplats: pcs is empty (length 0). gaussianModels: ${this.gaussianModels.length}`,
+				);
+			}
+			return false;
+		}
+
+		// Check if there are any points to render
+		const totalPoints = this.pcs.reduce((sum, pc) => sum + pc.numPoints, 0);
+
+		if (this.pcs.length === 0 || totalPoints === 0) {
+			if (
+				(globalThis as any).GS_VIDEO_EXPORT_DEBUG ||
+				(globalThis as any).GS_DEBUG_FLAG
+			) {
+				console.warn(
+					`[GaussianThreeJSRenderer #${this.instanceId}] drawSplats: Skipping - pcs: ${this.pcs.length}, totalPoints: ${totalPoints}`,
+				);
+			}
 			return false;
 		}
 
@@ -571,6 +682,19 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 					'[Depth] ⚠️ No depth view available - render pass has no depth attachment',
 				);
 			}
+		}
+
+		// Check if we are rendering to a specific target (e.g., depth capture)
+		// If so, do not render splats to the screen in onBeforeRender
+		const currentRenderTarget = renderer.getRenderTarget();
+		if (currentRenderTarget) {
+			if ((globalThis as any).GS_DEBUG_FLAG) {
+				console.log(
+					`[GaussianThreeJSRenderer #${this.instanceId}] onBeforeRender: Rendering to target, skipping screen render. Target:`,
+					currentRenderTarget,
+				);
+			}
+			return true;
 		}
 
 		const pass = encoder.beginRenderPass(passDescriptor);
@@ -859,6 +983,22 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
 		this.overlayBindGroupLayout = null;
 		this.overlaySampler = null;
 		this.overlayRenderedThisFrame = false;
+	}
+
+	public dispose(): void {
+		console.log(
+			`[GaussianThreeJSRenderer #${this.instanceId}] dispose() called. Removing from parent and cleaning up.`,
+		);
+		this.removeFromParent();
+		this.disposeDepthResources();
+		this.pcs = [];
+		this.gaussianModels = [];
+		this.geometry?.dispose();
+		if (Array.isArray(this.material)) {
+			this.material.forEach((m) => m.dispose());
+		} else {
+			this.material?.dispose();
+		}
 	}
 
 	private getViewport(): [number, number] {

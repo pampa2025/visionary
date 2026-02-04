@@ -74,11 +74,16 @@ export class VisionaryInitializer {
 			// @ts-ignore
 			const backend = renderer.backend;
 			const threeDevice = (backend as any).device as GPUDevice;
+			const threeAdapter = (backend as any).adapter as GPUAdapter;
 
 			if (typeof window !== 'undefined' && (window as any).ort) {
 				const ort = (window as any).ort;
-				if (ort.env && ort.env.webgpu) {
+				if (ort.env) {
+					ort.env.webgpu = ort.env.webgpu || {};
 					ort.env.webgpu.device = threeDevice;
+					if (threeAdapter) {
+						ort.env.webgpu.adapter = threeAdapter;
+					}
 					console.log('Configured ONNX to use Three.js WebGPU device');
 				}
 			}
