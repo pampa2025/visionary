@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>Visionary Minimal Demo</title>
+		<style>
+			body {
+				margin: 0;
+				overflow: hidden;
+				background-color: #333;
+			}
+			#canvas-container {
+				width: 100vw;
+				height: 100vh;
+				display: block;
+			}
+			#ui-container {
+				position: absolute;
+				top: 10px;
+				left: 10px;
+				background: rgba(0, 0, 0, 0.7);
+				padding: 10px;
+				color: white;
+				border-radius: 5px;
+				font-family: sans-serif;
+			}
+			#status {
+				margin-top: 10px;
+				font-size: 14px;
+			}
+		</style>
+	</head>
+	<body>
+		<div id="canvas-container"></div>
+		<div id="ui-container">
+			<input
+				type="file"
+				id="splat-file"
+				accept=".splat,.ply,.ksplat,.onnx,.sog"
+			/>
+			<div id="status">Select a .splat/.ply/.ksplat/.sog file</div>
+		</div>
+		<script type="module" src="./main.ts"></script>
+	</body>
+</html>

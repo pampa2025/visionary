@@ -48,3 +48,4 @@ models/
 onnx-export/.DS_Store
 onnx-export/ONNXExample-Avatar/.DS_Store
 src/.DS_Store
+**/*.DS_Store

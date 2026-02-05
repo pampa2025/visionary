@@ -34,12 +34,19 @@ export class GaussianThreeJSRenderer extends THREE.Mesh {
     private overlayRenderedThisFrame = false;
 
     public constructor(renderer: THREE.WebGPURenderer, scene: THREE.Scene, gaussianModels: GaussianModel[]) {
-        super();
+        // Provide dummy geometry and material to satisfy WebGPU renderer requirements
+        const geometry = new THREE.BoxGeometry(1, 1, 1);
+        const material = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0, depthWrite: false });
+        super(geometry, material);
 
         // Important: ensure this helper mesh is never frustum-culled by Three.js.
         // If it's culled (common because it has no geometry bounds), onBeforeRender
         // won't fire when the camera is very close, making GS appear "frozen".
         this.frustumCulled = false;
+        // The object itself must be visible for onBeforeRender to trigger,
+        // but we make the material invisible/transparent so the box doesn't actually appear.
+        // using opacity: 0 instead of visible: false on material to be safe, 
+        // though material.visible = false usually works too.
 
         this.threeRenderer = renderer;
         this.threeScene = scene;
